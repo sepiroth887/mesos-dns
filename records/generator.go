@@ -87,7 +87,7 @@ func (rg *RecordGenerator) ParseState(leader string, c Config) error {
 	}
 
 	// insert state
-	rg.InsertState(sj, c.Domain, c.SOARname, c.Listener, c.Masters, hostSpec)
+	rg.InsertState(sj, c.Domain, c.SOARname, c.Listener, c.Masters, c.StaticEntryConfig.Entries, hostSpec)
 	return nil
 }
 
@@ -233,7 +233,7 @@ func sanitizedSlaveAddress(hostname string, spec labels.HostNameSpec) string {
 
 // InsertState transforms a StateJSON into RecordGenerator RRs
 func (rg *RecordGenerator) InsertState(sj StateJSON, domain string, ns string,
-	listener string, masters []string, spec labels.HostNameSpec) error {
+	listener string, masters []string, staticEntries []StaticEntry, spec labels.HostNameSpec) error {
 
 	// creates a map with slave IP addresses (IPv4)
 	rg.Slaves = make(map[string]string)
@@ -277,6 +277,11 @@ func (rg *RecordGenerator) InsertState(sj StateJSON, domain string, ns string,
 				}
 			}
 		}
+	}
+
+	// Static Entries
+	for _, entry := range staticEntries {
+		rg.insertRR(entry.Fqdn, entry.Value, entry.Type)
 	}
 
 	rg.listenerRecord(listener, ns)

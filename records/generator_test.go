@@ -247,8 +247,12 @@ func TestInsertState(t *testing.T) {
 
 	masters := []string{"144.76.157.37:5050"}
 	spec := labels.ForRFC952()
+	staticEntries := []StaticEntry{
+		StaticEntry{Type: "A", Fqdn: "hello-static.mesos", Value: "127.0.0.2"},
+		StaticEntry{Type: "SRV", Fqdn: "_hello-static._tcp.mesos", Value: "hello.static:443"},
+	}
 	rg := &RecordGenerator{}
-	rg.InsertState(sj, "mesos", "mesos-dns.mesos.", "127.0.0.1", masters, spec)
+	rg.InsertState(sj, "mesos", "mesos-dns.mesos.", "127.0.0.1", masters, staticEntries, spec)
 
 	// ensure we are only collecting running tasks
 	_, ok := rg.SRVs["_poseidon._tcp.marathon.mesos."]
@@ -287,12 +291,12 @@ func TestInsertState(t *testing.T) {
 	}
 
 	// test for 10 SRV names
-	if len(rg.SRVs) != 10 {
+	if len(rg.SRVs) != 11 {
 		t.Error("not enough SRVs")
 	}
 
 	// test for 5 A names
-	if len(rg.As) != 13 {
+	if len(rg.As) != 14 {
 		t.Error("not enough As")
 	}
 
@@ -315,6 +319,18 @@ func TestInsertState(t *testing.T) {
 		t.Error("not a proper SRV record")
 	}
 
+	// ensure we find the static A record
+	_, ok = rg.As["hello-static.mesos"]
+	if !ok {
+		t.Error("Missing static A record")
+	}
+
+	// ensure we find static SRV record
+	rrs = rg.SRVs["_hello-static._tcp.mesos"]
+	t.Log(rrs)
+	if len(rrs) != 1 {
+		t.Error("not enough static SRV records")
+	}
 }
 
 // ensure we only generate one A record for each host

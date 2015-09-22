@@ -71,29 +71,36 @@ type Config struct {
 
 	// EnforceRFC952 will enforce an older, more strict set of rules for DNS labels
 	EnforceRFC952 bool
+
+	// StaticEntryFile is the path to a file containing required static DNS entries
+	StaticEntryFile string
+
+	// StaticEntryConfig is the deserialized content of StaticEntryFile
+	StaticEntryConfig StaticEntryConfig
 }
 
 // SetConfig instantiates a Config struct read in from config.json
 func SetConfig(cjson string) (c Config) {
 	c = Config{
-		RefreshSeconds: 60,
-		TTL:            60,
-		Domain:         "mesos",
-		Port:           53,
-		Timeout:        5,
-		SOARname:       "root.ns1.mesos",
-		SOAMname:       "ns1.mesos",
-		SOARefresh:     60,
-		SOARetry:       600,
-		SOAExpire:      86400,
-		SOAMinttl:      60,
-		Resolvers:      []string{"8.8.8.8"},
-		Listener:       "0.0.0.0",
-		HttpPort:       8123,
-		DnsOn:          true,
-		HttpOn:         true,
-		ExternalOn:     true,
-		RecurseOn:      true,
+		RefreshSeconds:  60,
+		TTL:             60,
+		Domain:          "mesos",
+		Port:            53,
+		Timeout:         5,
+		SOARname:        "root.ns1.mesos",
+		SOAMname:        "ns1.mesos",
+		SOARefresh:      60,
+		SOARetry:        600,
+		SOAExpire:       86400,
+		SOAMinttl:       60,
+		Resolvers:       []string{"8.8.8.8"},
+		Listener:        "0.0.0.0",
+		HttpPort:        8123,
+		DnsOn:           true,
+		HttpOn:          true,
+		ExternalOn:      true,
+		RecurseOn:       true,
+		StaticEntryFile: "",
 	}
 
 	// read configuration file
@@ -126,6 +133,9 @@ func SetConfig(cjson string) (c Config) {
 	}
 	if err = validateMasters(c.Masters); err != nil {
 		logging.Error.Fatalf("Masters validation failed: %v", err)
+	}
+	if c.StaticEntryConfig, err = validateStaticEntryFile(c.StaticEntryFile); err != nil {
+		logging.Error.Fatalf("StaticEntryFile validation failed %v", err)
 	}
 
 	if c.ExternalOn {
@@ -178,11 +188,12 @@ func SetConfig(cjson string) (c Config) {
 	logging.Verbose.Println("   - HttpOn: ", c.HttpOn)
 	logging.Verbose.Println("   - ConfigFile: ", c.File)
 	logging.Verbose.Println("   - EnforceRFC952: ", c.EnforceRFC952)
+	logging.Verbose.Println("   - StaticEntryFile: ", c.StaticEntryFile)
 
 	return c
 }
 
-// Returns the first nameserver in /etc/resolv.conf
+// GetLocalDNS returns the first nameserver in /etc/resolv.conf
 // used for non-Mesos  queries
 func GetLocalDNS() []string {
 	conf, err := dns.ClientConfigFromFile("/etc/resolv.conf")

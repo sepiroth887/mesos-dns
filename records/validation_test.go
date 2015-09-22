@@ -1,6 +1,8 @@
 package records
 
 import (
+	"io/ioutil"
+	"os"
 	"testing"
 )
 
@@ -68,5 +70,96 @@ func TestValidateResolvers(t *testing.T) {
 		} else {
 			t.Fatalf("test %d failed, expected validation error for resolvers(%d) %v", i+1, len(tc.rs), tc.rs)
 		}
+	}
+}
+
+func TestValidateStaticEntryFile(t *testing.T) {
+	// Testing valid first
+	validJSON := "{ \"Entries\" : [{\"Fqdn\": \"hello.world\", \"Type\": \"A\", \"Value\": \"10.0.0.1\"}, {\"Fqdn\": \"_hello._tcp_.world\", \"Type\": \"SRV\", \"Value\": \"10.0.0.1:323\"}]}"
+
+	CreateTempFile(validJSON, "/tmp/valid.json", t)
+	conf, err := validateStaticEntryFile("/tmp/valid.json")
+
+	if err != nil {
+		t.Fatalf("Failed to parse valid json: %s", err)
+	}
+
+	if len(conf.Entries) != 2 {
+		t.Fatalf("Incorrect entry set: expected %d got %d", 2, len(conf.Entries))
+	}
+
+	// Testing missing file
+	conf, err = validateStaticEntryFile("/no/file")
+	if err == nil {
+		t.Fatalf("Expected Error")
+	}
+
+	// Testing empty StaticEntryFile fields
+	conf, err = validateStaticEntryFile("")
+	if err != nil {
+		t.Fatalf("Expected no error but got: %s", err)
+	}
+
+	if len(conf.Entries) != 0 {
+		t.Fatal("Expected empty entry set")
+	}
+
+	// Testing bad JSON
+	invalidJSON := "{ \"BADFIELD\" : [{\"Fqdn\": \"hello.world\", \"Type\": \"A\", \"Value\": \"10.0.0.1Fqdn\": \"_hello._tcp_.world\", \"Type\": \"SRV\", \"Value\": \"10.0.0.1:323\"}]}"
+
+	CreateTempFile(invalidJSON, "/tmp/invalid.json", t)
+	conf, err = validateStaticEntryFile("/tmp/invalid.json")
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	// Testing bad Record data
+	invalidFQDN := "{ \"Entries\" : [{\"Fqdn\": \"hello.world+-23\", \"Type\": \"A\", \"Value\": \"10.0.0.1\"}]}"
+	invalidIP := "{ \"Entries\" : [{\"Fqdn\": \"hello.world\", \"Type\": \"A\", \"Value\": \"10.0.0.av1\"}]}"
+	invalidSRV := "{ \"Entries\" : [{\"Fqdn\": \"_hello+110.!world\", \"Type\": \"SRV\", \"Value\": \"10.0.0.0:1234\"}]}"
+	invalidHostPort := "{ \"Entries\" : [{\"Fqdn\": \"_hello._world\", \"Type\": \"SRV\", \"Value\": \"10.0.ase20.0:a1234\"}]}"
+
+	CreateTempFile(invalidFQDN, "/tmp/invalid.json", t)
+	conf, err = validateStaticEntryFile("/tmp/invalid.json")
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	CreateTempFile(invalidIP, "/tmp/invalid.json", t)
+	conf, err = validateStaticEntryFile("/tmp/invalid.json")
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	CreateTempFile(invalidSRV, "/tmp/invalid.json", t)
+	conf, err = validateStaticEntryFile("/tmp/invalid.json")
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	CreateTempFile(invalidHostPort, "/tmp/invalid.json", t)
+	conf, err = validateStaticEntryFile("/tmp/invalid.json")
+
+	if err == nil {
+		t.Fatal("Expected error")
+	}
+
+	Cleanup("/tmp/invalid.json", "/tmp/valid.json")
+}
+
+func CreateTempFile(data, filename string, t *testing.T) {
+	err := ioutil.WriteFile(filename, []byte(data), 0644)
+	if err != nil {
+		t.Fatalf("Failed to generate temp file: %s", err)
+	}
+}
+
+func Cleanup(files ...string) {
+	for _, file := range files {
+		os.Remove(file)
 	}
 }

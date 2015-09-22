@@ -1,0 +1,6 @@
+{
+  "Entries": [
+    { "Fqdn": "vault.marathon.mesos.", "Type": "A", "Value": "100.127.5.140" },
+    { "Fqdn": "vault.marathon.mesos.", "Type": "A", "Value": "100.127.5.137" },
+    { "Fqdn": "test.marathon.mesos.", "Type": "A", "Value": "100.127.5.144" }
+]}
