@@ -1,13 +1,9 @@
-// package resolver contains functions to handle resolving .mesos
-// domains
+// Package resolver contains functions to handle resolving .mesos domains
 package resolver
 
 import (
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/http"
@@ -17,44 +13,70 @@ import (
 	"time"
 
 	"github.com/emicklei/go-restful"
-	"github.com/mesos/mesos-go/detector"
-	_ "github.com/mesos/mesos-go/detector/zoo"
-	mesos "github.com/mesos/mesos-go/mesosproto"
+	_ "github.com/mesos/mesos-go/detector/zoo" // Registers the ZK detector
+	"github.com/mesosphere/mesos-dns/exchanger"
 	"github.com/mesosphere/mesos-dns/logging"
 	"github.com/mesosphere/mesos-dns/records"
 	"github.com/mesosphere/mesos-dns/util"
 	"github.com/miekg/dns"
 )
 
-var (
-	recurseCnt = 3
-)
-
-// holds configuration state and the resource records
+// Resolver holds configuration state and the resource records
 type Resolver struct {
-	version    string
-	config     records.Config
-	rs         *records.RecordGenerator
-	rsLock     sync.RWMutex
-	leader     string
-	leaderLock sync.RWMutex
+	masters []string
+	version string
+	config  records.Config
+	rs      *records.RecordGenerator
+	rsLock  sync.RWMutex
+	rng     *rand.Rand
 
 	// pluggable external DNS resolution, mainly for unit testing
-	extResolver func(r *dns.Msg, nameserver string, proto string, cnt int) (*dns.Msg, error)
-	// pluggable ZK detection, mainly for unit testing
-	startZKdetection func(zkurl string, leaderChanged func(string)) error
+	extResolver exchanger.Exchanger
 }
 
+// New returns a Resolver with the given version and configuration.
 func New(version string, config records.Config) *Resolver {
 	r := &Resolver{
 		version: version,
 		config:  config,
 		rs:      &records.RecordGenerator{},
+		rng:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		masters: append([]string{""}, config.Masters...),
 	}
-	r.extResolver = r.defaultExtResolver
-	r.startZKdetection = startDefaultZKdetector
+
+	if !config.ExternalOn {
+		return r
+	}
+
+	timeout := 5 * time.Second
+	if config.Timeout != 0 {
+		timeout = time.Duration(config.Timeout) * time.Second
+	}
+
+	r.extResolver = newClient(timeout)
+
 	return r
 }
+
+func newClient(timeout time.Duration) exchanger.Exchanger {
+	clients := make([]exchanger.Exchanger, 2)
+	for i, proto := range [...]string{"udp", "tcp"} { // See RFC5966
+		clients[i] = &dns.Client{
+			Net:          proto,
+			DialTimeout:  timeout,
+			ReadTimeout:  timeout,
+			WriteTimeout: timeout,
+		}
+	}
+	return exchanger.Decorate(
+		exchanger.While(truncated, clients...),
+		exchanger.Recursion(3, exchanger.Recurse),
+		exchanger.ErrorLogging(logging.Error),
+		exchanger.Instrumentation(logging.CurLog.NonMesosRecursed),
+	)
+}
+
+func truncated(m *dns.Msg) bool { return m.Truncated }
 
 // return the current (read-only) record set. attempts to write to the returned
 // object will likely result in a data race.
@@ -64,7 +86,8 @@ func (res *Resolver) records() *records.RecordGenerator {
 	return res.rs
 }
 
-// launches DNS server for a resolver, returns immediately
+// LaunchDNS starts a (TCP and UDP) DNS server for the Resolver,
+// returning a error channel to which errors are asynchronously sent.
 func (res *Resolver) LaunchDNS() <-chan error {
 	// Handers for Mesos requests
 	dns.HandleFunc(res.config.Domain+".", panicRecover(res.HandleMesos))
@@ -79,7 +102,7 @@ func (res *Resolver) LaunchDNS() <-chan error {
 	return errCh
 }
 
-// starts a DNS server for net protocol (tcp/udp), returns immediately.
+// Serve starts a DNS server for net protocol (tcp/udp), returns immediately.
 // the returned signal chan is closed upon the server successfully entering the listening phase.
 // if the server aborts then an error is sent on the error chan.
 func (res *Resolver) Serve(proto string) (<-chan struct{}, <-chan error) {
@@ -106,54 +129,17 @@ func (res *Resolver) Serve(proto string) (<-chan struct{}, <-chan error) {
 	return ch, errCh
 }
 
-// launches Zookeeper detector, returns immediately two chans: the first fires an empty
-// struct whenever there's a new (non-nil) mesos leader, the second if there's an unrecoverable
-// error in the master detector.
-func (res *Resolver) LaunchZK(initialDetectionTimeout time.Duration) (<-chan struct{}, <-chan error) {
-	var startedOnce sync.Once
-	startedCh := make(chan struct{})
-	errCh := make(chan error, 1)
-	leaderCh := make(chan struct{}, 1) // the first write never blocks
-
-	listenerFunc := func(newLeader string) {
-		defer func() {
-			if newLeader != "" {
-				leaderCh <- struct{}{}
-				startedOnce.Do(func() { close(startedCh) })
-			}
-		}()
-		res.leaderLock.Lock()
-		defer res.leaderLock.Unlock()
-		res.leader = newLeader
-	}
-	go func() {
-		defer util.HandleCrash()
-
-		err := res.startZKdetection(res.config.Zk, listenerFunc)
-		if err != nil {
-			errCh <- err
-			return
-		}
-
-		logging.VeryVerbose.Println("Warning: waiting for initial information from Zookeper.")
-		select {
-		case <-startedCh:
-			logging.VeryVerbose.Println("Info: got initial information from Zookeper.")
-		case <-time.After(initialDetectionTimeout):
-			errCh <- fmt.Errorf("timed out waiting for initial ZK detection, exiting")
-		}
-	}()
-	return leaderCh, errCh
+// SetMasters sets the given masters.
+// This method is not goroutine-safe.
+func (res *Resolver) SetMasters(masters []string) {
+	res.masters = masters
 }
 
-// triggers a new refresh from mesos master
+// Reload triggers a new state load from the configured mesos masters.
+// This method is not goroutine-safe.
 func (res *Resolver) Reload() {
 	t := records.RecordGenerator{}
-	// Being very conservative
-	res.leaderLock.RLock()
-	currentLeader := res.leader
-	res.leaderLock.RUnlock()
-	err := t.ParseState(currentLeader, res.config)
+	err := t.ParseState(res.config, res.masters...)
 
 	if err == nil {
 		timestamp := uint32(time.Now().Unix())
@@ -165,47 +151,8 @@ func (res *Resolver) Reload() {
 	} else {
 		logging.VeryVerbose.Println("Warning: master not found; keeping old DNS state")
 	}
-}
 
-// defaultExtResolver queries other nameserver, potentially recurses; callers should probably be invoking extResolver
-// instead since that's the pluggable entrypoint into external resolution.
-func (res *Resolver) defaultExtResolver(r *dns.Msg, nameserver string, proto string, cnt int) (*dns.Msg, error) {
-	var in *dns.Msg
-	var err error
-
-	c := new(dns.Client)
-	c.Net = proto
-
-	var t time.Duration = 5 * 1e9
-	if res.config.Timeout != 0 {
-		t = time.Duration(int64(res.config.Timeout * 1e9))
-	}
-
-	c.DialTimeout = t
-	c.ReadTimeout = t
-	c.WriteTimeout = t
-
-	in, _, err = c.Exchange(r, nameserver)
-	if err != nil {
-		return in, err
-	}
-
-	// recurse
-	if (in != nil) && (len(in.Answer) == 0) && (!in.MsgHdr.Authoritative) && (len(in.Ns) > 0) && (err != nil) {
-
-		if cnt == recurseCnt {
-			logging.CurLog.NonMesosRecursed.Inc()
-		}
-
-		if cnt > 0 {
-			if soa, ok := (in.Ns[0]).(*dns.SOA); ok {
-				return res.defaultExtResolver(r, net.JoinHostPort(soa.Ns, "53"), proto, cnt-1)
-			}
-		}
-
-	}
-
-	return in, err
+	logging.PrintCurLog()
 }
 
 // formatSRV returns the SRV resource record for target
@@ -289,19 +236,18 @@ func (res *Resolver) formatNS(dom string) (*dns.NS, error) {
 }
 
 // reorders answers for very basic load balancing
-func shuffleAnswers(answers []dns.RR) []dns.RR {
-	rand.Seed(time.Now().UTC().UnixNano())
-
+func shuffleAnswers(rng *rand.Rand, answers []dns.RR) []dns.RR {
 	n := len(answers)
 	for i := 0; i < n; i++ {
-		r := i + rand.Intn(n-i)
+		r := i + rng.Intn(n-i)
 		answers[r], answers[i] = answers[i], answers[r]
 	}
 
 	return answers
 }
 
-// makes non-mesos queries to external nameserver
+// HandleNonMesos handles non-mesos queries by recursing to a configured
+// external resolver.
 func (res *Resolver) HandleNonMesos(w dns.ResponseWriter, r *dns.Msg) {
 	var err error
 	var m *dns.Msg
@@ -310,20 +256,14 @@ func (res *Resolver) HandleNonMesos(w dns.ResponseWriter, r *dns.Msg) {
 	logging.CurLog.NonMesosRequests.Inc()
 
 	// If external request are disabled
-	if !res.config.ExternalOn {
+	if res.extResolver == nil {
 		m = new(dns.Msg)
 		// set refused
 		m.SetRcode(r, 5)
 	} else {
-
-		proto := "udp"
-		if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
-			proto = "tcp"
-		}
-
 		for _, resolver := range res.config.Resolvers {
 			nameserver := net.JoinHostPort(resolver, "53")
-			m, err = res.extResolver(r, nameserver, proto, recurseCnt)
+			m, _, err = res.extResolver.Exchange(r, nameserver)
 			if err == nil {
 				break
 			}
@@ -334,7 +274,7 @@ func (res *Resolver) HandleNonMesos(w dns.ResponseWriter, r *dns.Msg) {
 	if m == nil {
 		m = new(dns.Msg)
 		m.SetRcode(r, 2)
-		err = errors.New("nil msg")
+		err = fmt.Errorf("failed external DNS lookup of %q: %v", r.Question[0].Name, err)
 	}
 	if err != nil {
 		logging.Error.Println(r.Question[0].Name)
@@ -356,111 +296,132 @@ func (res *Resolver) HandleNonMesos(w dns.ResponseWriter, r *dns.Msg) {
 // question with resource answer(s)
 // it can handle {A, SRV, ANY}
 func (res *Resolver) HandleMesos(w dns.ResponseWriter, r *dns.Msg) {
-	var err error
-
-	dom := strings.ToLower(cleanWild(r.Question[0].Name))
-	qType := r.Question[0].Qtype
-
-	m := new(dns.Msg)
-	m.Authoritative = true
-	m.RecursionAvailable = res.config.RecurseOn
-	m.SetReply(r)
-
-	rs := res.records()
-
-	// SRV requests
-	if (qType == dns.TypeSRV) || (qType == dns.TypeANY) {
-		for _, srv := range rs.SRVs[dom] {
-			rr, err := res.formatSRV(r.Question[0].Name, srv)
-			if err != nil {
-				logging.Error.Println(err)
-			} else {
-				m.Answer = append(m.Answer, rr)
-				// return one corresponding A record add additional info
-				host := strings.Split(srv, ":")[0]
-				if len(rs.As[host]) != 0 {
-					rr, err := res.formatA(host, rs.As[host][0])
-					if err != nil {
-						logging.Error.Println(err)
-					} else {
-						m.Extra = append(m.Extra, rr)
-					}
-				}
-
-			}
-		}
-	}
-
-	// A requests
-	if (qType == dns.TypeA) || (qType == dns.TypeANY) {
-		for _, a := range rs.As[dom] {
-			rr, err := res.formatA(dom, a)
-			if err != nil {
-				logging.Error.Println(err)
-			} else {
-				m.Answer = append(m.Answer, rr)
-			}
-
-		}
-	}
-
-	// SOA requests
-	if (qType == dns.TypeSOA) || (qType == dns.TypeANY) {
-		rr, err := res.formatSOA(r.Question[0].Name)
-		if err != nil {
-			logging.Error.Println(err)
-		} else {
-			m.Ns = append(m.Ns, rr)
-		}
-	}
-
-	// NS requests
-	if (qType == dns.TypeNS) || (qType == dns.TypeANY) {
-		rr, err := res.formatNS(r.Question[0].Name)
-		logging.Error.Println("NS request")
-		if err != nil {
-			logging.Error.Println(err)
-		} else {
-			m.Ns = append(m.Ns, rr)
-		}
-	}
-
-	// shuffle answers
-	m.Answer = shuffleAnswers(m.Answer)
-	// tracing info
 	logging.CurLog.MesosRequests.Inc()
 
-	if err != nil {
-		logging.CurLog.MesosFailed.Inc()
-	} else if (qType == dns.TypeAAAA) && (len(rs.SRVs[dom]) > 0 || len(rs.As[dom]) > 0) {
-		// correct handling of AAAA if there are A or SRV records
-		m.Authoritative = true
-		// set NOERROR
-		m.SetRcode(r, 0)
-		// leave answer empty (NOERROR --> NODATA)
+	m := &dns.Msg{MsgHdr: dns.MsgHdr{
+		Authoritative:      true,
+		RecursionAvailable: res.config.RecurseOn,
+	}}
+	m.SetReply(r)
 
+	var errs multiError
+	rs := res.records()
+	name := strings.ToLower(cleanWild(r.Question[0].Name))
+	switch r.Question[0].Qtype {
+	case dns.TypeSRV:
+		errs.Add(res.handleSRV(rs, name, m, r))
+	case dns.TypeA:
+		errs.Add(res.handleA(rs, name, m))
+	case dns.TypeSOA:
+		errs.Add(res.handleSOA(m, r))
+	case dns.TypeNS:
+		errs.Add(res.handleNS(m, r))
+	case dns.TypeANY:
+		errs.Add(
+			res.handleSRV(rs, name, m, r),
+			res.handleA(rs, name, m),
+			res.handleSOA(m, r),
+			res.handleNS(m, r),
+		)
+	}
+
+	if len(m.Answer) == 0 {
+		errs.Add(res.handleEmpty(rs, name, m, r))
 	} else {
-		// no answers but not a {SOA,SRV} request
-		if len(m.Answer) == 0 && (qType != dns.TypeSOA) && (qType != dns.TypeNS) && (qType != dns.TypeSRV) {
-			// set NXDOMAIN
-			m.SetRcode(r, 3)
+		shuffleAnswers(res.rng, m.Answer)
+		logging.CurLog.MesosSuccess.Inc()
+	}
 
-			rr, err := res.formatSOA(r.Question[0].Name)
-			if err != nil {
-				logging.Error.Println(err)
-			} else {
-				m.Ns = append(m.Ns, rr)
-			}
-
-			logging.CurLog.MesosNXDomain.Inc()
-			logging.VeryVerbose.Println("total A rrs:\t" + strconv.Itoa(len(rs.As)))
-			logging.VeryVerbose.Println("failed looking for " + r.Question[0].String())
-		} else {
-			logging.CurLog.MesosSuccess.Inc()
-		}
+	if !errs.Nil() {
+		logging.Error.Println(errs.Error())
+		logging.CurLog.MesosFailed.Inc()
 	}
 
 	reply(w, m)
+}
+
+func (res *Resolver) handleSRV(rs *records.RecordGenerator, name string, m, r *dns.Msg) error {
+	var errs multiError
+	for _, srv := range rs.SRVs[name] {
+		srvRR, err := res.formatSRV(r.Question[0].Name, srv)
+		if err != nil {
+			errs.Add(err)
+			continue
+		}
+
+		m.Answer = append(m.Answer, srvRR)
+		host := strings.Split(srv, ":")[0]
+		if len(rs.As[host]) == 0 {
+			continue
+		}
+
+		aRR, err := res.formatA(host, rs.As[host][0])
+		if err != nil {
+			errs.Add(err)
+			continue
+		}
+
+		m.Extra = append(m.Extra, aRR)
+	}
+	return errs
+}
+
+func (res *Resolver) handleA(rs *records.RecordGenerator, name string, m *dns.Msg) error {
+	var errs multiError
+	for _, a := range rs.As[name] {
+		rr, err := res.formatA(name, a)
+		if err != nil {
+			errs.Add(err)
+			continue
+		}
+		m.Answer = append(m.Answer, rr)
+	}
+	return errs
+}
+
+func (res *Resolver) handleSOA(m, r *dns.Msg) error {
+	rr, err := res.formatSOA(r.Question[0].Name)
+	if err != nil {
+		return err
+	}
+	m.Ns = append(m.Ns, rr)
+	return nil
+}
+
+func (res *Resolver) handleNS(m, r *dns.Msg) error {
+	rr, err := res.formatNS(r.Question[0].Name)
+	logging.Error.Println("NS request")
+	if err != nil {
+		return err
+	}
+	m.Ns = append(m.Ns, rr)
+	return nil
+}
+
+func (res *Resolver) handleEmpty(rs *records.RecordGenerator, name string, m, r *dns.Msg) error {
+	qType := r.Question[0].Qtype
+	switch qType {
+	case dns.TypeSOA, dns.TypeNS, dns.TypeSRV:
+		logging.CurLog.MesosSuccess.Inc()
+		return nil
+	}
+
+	m.Rcode = dns.RcodeNameError
+	if qType == dns.TypeAAAA && len(rs.SRVs[name])+len(rs.As[name]) > 0 {
+		m.Rcode = dns.RcodeSuccess
+	}
+
+	logging.CurLog.MesosNXDomain.Inc()
+	logging.VeryVerbose.Println("total A rrs:\t" + strconv.Itoa(len(rs.As)))
+	logging.VeryVerbose.Println("failed looking for " + r.Question[0].String())
+
+	rr, err := res.formatSOA(r.Question[0].Name)
+	if err != nil {
+		return err
+	}
+
+	m.Ns = append(m.Ns, rr)
+	return nil
 }
 
 // reply writes the given dns.Msg out to the given dns.ResponseWriter,
@@ -496,12 +457,13 @@ func (res *Resolver) configureHTTP() {
 	restful.Add(ws)
 }
 
-// starts an http server for mesos-dns queries, returns immediately
+// LaunchHTTP starts an HTTP server for the Resolver, returning a error channel
+// to which errors are asynchronously sent.
 func (res *Resolver) LaunchHTTP() <-chan error {
 	defer util.HandleCrash()
 
 	res.configureHTTP()
-	portString := ":" + strconv.Itoa(res.config.HttpPort)
+	portString := ":" + strconv.Itoa(res.config.HTTPPort)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -517,133 +479,116 @@ func (res *Resolver) LaunchHTTP() <-chan error {
 	return errCh
 }
 
-// Reports configuration through REST interface
+// RestConfig handles HTTP requests of Resolver configuration.
 func (res *Resolver) RestConfig(req *restful.Request, resp *restful.Response) {
-	output, err := json.Marshal(res.config)
-	if err != nil {
+	if err := resp.WriteAsJson(res.config); err != nil {
 		logging.Error.Println(err)
 	}
-
-	io.WriteString(resp, string(output))
 }
 
-// Reports Mesos-DNS version through REST interface
+// RestVersion handles HTTP requests of Mesos-DNS version.
 func (res *Resolver) RestVersion(req *restful.Request, resp *restful.Response) {
-	mapV := map[string]string{"Service": "Mesos-DNS",
+	err := resp.WriteAsJson(map[string]string{
+		"Service": "Mesos-DNS",
 		"Version": res.version,
-		"URL":     "https://github.com/mesosphere/mesos-dns"}
-	output, err := json.Marshal(mapV)
+		"URL":     "https://github.com/mesosphere/mesos-dns",
+	})
 	if err != nil {
 		logging.Error.Println(err)
 	}
-	io.WriteString(resp, string(output))
 }
 
-// Reports Mesos-DNS version through http interface
+// RestHost handles HTTP requests of DNS A records of the given host.
 func (res *Resolver) RestHost(req *restful.Request, resp *restful.Response) {
-
 	host := req.PathParameter("host")
 	// clean up host name
 	dom := strings.ToLower(cleanWild(host))
 	if dom[len(dom)-1] != '.' {
 		dom += "."
 	}
-
-	mapH := make([]map[string]string, 0)
 	rs := res.records()
 
-	for _, ip := range rs.As[dom] {
-		t := map[string]string{"host": dom, "ip": ip}
-		mapH = append(mapH, t)
-	}
-	empty := (len(rs.As[dom]) == 0)
-	if empty {
-		t := map[string]string{"host": "", "ip": ""}
-		mapH = append(mapH, t)
+	type record struct {
+		Host string `json:"host"`
+		IP   string `json:"ip"`
 	}
 
-	output, err := json.Marshal(mapH)
-	if err != nil {
+	aRRs := rs.As[dom]
+	records := make([]record, 0, len(aRRs))
+	for _, ip := range aRRs {
+		records = append(records, record{dom, ip})
+	}
+
+	if len(records) == 0 {
+		records = append(records, record{})
+	}
+
+	if err := resp.WriteAsJson(records); err != nil {
 		logging.Error.Println(err)
 	}
-	io.WriteString(resp, string(output))
 
-	// stats
-	mesosrq := strings.HasSuffix(dom, res.config.Domain+".")
-	if mesosrq {
+	stats(dom, res.config.Domain+".", len(aRRs) > 0)
+}
+
+func stats(domain, zone string, success bool) {
+	if strings.HasSuffix(domain, zone) {
 		logging.CurLog.MesosRequests.Inc()
-		if empty {
-			logging.CurLog.MesosNXDomain.Inc()
-		} else {
+		if success {
 			logging.CurLog.MesosSuccess.Inc()
+		} else {
+			logging.CurLog.MesosNXDomain.Inc()
 		}
 	} else {
 		logging.CurLog.NonMesosRequests.Inc()
 		logging.CurLog.NonMesosFailed.Inc()
 	}
-
 }
 
-// Reports Mesos-DNS version through http interface
+// RestPorts is an HTTP handler which is currently not implemented.
 func (res *Resolver) RestPorts(req *restful.Request, resp *restful.Response) {
-	io.WriteString(resp, "To be implemented...")
+	err := resp.WriteErrorString(http.StatusNotImplemented, "To be implemented...")
+	if err != nil {
+		logging.Error.Println(err)
+	}
 }
 
-// Reports Mesos-DNS version through http interface
+// RestService handles HTTP requests of DNS SRV records for the given name.
 func (res *Resolver) RestService(req *restful.Request, resp *restful.Response) {
-
-	var ip string
-
 	service := req.PathParameter("service")
-
 	// clean up service name
 	dom := strings.ToLower(cleanWild(service))
 	if dom[len(dom)-1] != '.' {
 		dom += "."
 	}
-
-	mapS := make([]map[string]string, 0)
 	rs := res.records()
 
-	for _, srv := range rs.SRVs[dom] {
-		h, port, _ := net.SplitHostPort(srv)
-		p, _ := strconv.Atoi(port)
-		if len(rs.As[h]) != 0 {
-			ip = rs.As[h][0]
-		} else {
-			ip = ""
+	type record struct {
+		Service string `json:"service"`
+		Host    string `json:"host"`
+		IP      string `json:"ip"`
+		Port    string `json:"port"`
+	}
+
+	srvRRs := rs.SRVs[dom]
+	records := make([]record, 0, len(srvRRs))
+	for _, s := range srvRRs {
+		host, port, _ := net.SplitHostPort(s)
+		var ip string
+		if r := rs.As[host]; len(r) != 0 {
+			ip = r[0]
 		}
-
-		t := map[string]string{"service": service, "host": h, "ip": ip, "port": strconv.Itoa(p)}
-		mapS = append(mapS, t)
+		records = append(records, record{service, host, ip, port})
 	}
 
-	empty := (len(rs.SRVs[dom]) == 0)
-	if empty {
-		t := map[string]string{"service": "", "host": "", "ip": "", "port": ""}
-		mapS = append(mapS, t)
+	if len(records) == 0 {
+		records = append(records, record{})
 	}
 
-	output, err := json.Marshal(mapS)
-	if err != nil {
+	if err := resp.WriteAsJson(records); err != nil {
 		logging.Error.Println(err)
 	}
-	io.WriteString(resp, string(output))
 
-	// stats
-	mesosrq := strings.HasSuffix(dom, res.config.Domain+".")
-	if mesosrq {
-		logging.CurLog.MesosRequests.Inc()
-		if empty {
-			logging.CurLog.MesosNXDomain.Inc()
-		} else {
-			logging.CurLog.MesosSuccess.Inc()
-		}
-	} else {
-		logging.CurLog.NonMesosRequests.Inc()
-		logging.CurLog.NonMesosFailed.Inc()
-	}
-
+	stats(dom, res.config.Domain+".", len(srvRRs) > 0)
 }
 
 // panicRecover catches any panics from the resolvers and sets an error
@@ -662,53 +607,43 @@ func panicRecover(f func(w dns.ResponseWriter, r *dns.Msg)) func(w dns.ResponseW
 	}
 }
 
-// Start a Zookeeper listener to track leading master, invokes callback function when
-// master changes are reported.
-func startDefaultZKdetector(zkurl string, leaderChanged func(string)) error {
-
-	// start listener
-	logging.Verbose.Println("Starting master detector for ZK ", zkurl)
-	md, err := detector.New(zkurl)
-	if err != nil {
-		return fmt.Errorf("failed to create master detector: %v", err)
-	}
-
-	// and listen for master changes
-	if err := md.Detect(detector.OnMasterChanged(func(info *mesos.MasterInfo) {
-		leader := ""
-		if leaderChanged != nil {
-			defer func() {
-				leaderChanged(leader)
-			}()
-		}
-		logging.VeryVerbose.Println("Updated Zookeeper info: ", info)
-		if info == nil {
-			logging.Error.Println("No leader available in Zookeeper.")
-		} else {
-			if host := info.GetHostname(); host != "" {
-				leader = host
-			} else {
-				// unpack IPv4
-				octets := make([]byte, 4, 4)
-				binary.BigEndian.PutUint32(octets, info.GetIp())
-				ipv4 := net.IP(octets)
-				leader = ipv4.String()
-			}
-			leader = fmt.Sprintf("%s:%d", leader, info.GetPort())
-			logging.Verbose.Println("new master in Zookeeper ", leader)
-		}
-	})); err != nil {
-		return fmt.Errorf("failed to initialize master detector: %v", err)
-	}
-	return nil
-}
-
 // cleanWild strips any wildcards out thus mapping cleanly to the
 // original serviceName
-func cleanWild(dom string) string {
-	if strings.Contains(dom, ".*") {
-		return strings.Replace(dom, ".*", "", -1)
-	} else {
-		return dom
+func cleanWild(name string) string {
+	if strings.Contains(name, ".*") {
+		return strings.Replace(name, ".*", "", -1)
 	}
+	return name
+}
+
+type multiError []error
+
+func (e multiError) Add(err ...error) multiError {
+	for _, e1 := range err {
+		if me, ok := e1.(multiError); ok {
+			e = append(e, me...)
+		} else if e1 != nil {
+			e = append(e, e1)
+		}
+	}
+	return e
+}
+
+func (e multiError) Error() string {
+	errs := make([]string, len(e))
+	for i := range errs {
+		if e[i] != nil {
+			errs[i] = e[i].Error()
+		}
+	}
+	return strings.Join(errs, "; ")
+}
+
+func (e multiError) Nil() bool {
+	for _, err := range e {
+		if err != nil {
+			return false
+		}
+	}
+	return true
 }

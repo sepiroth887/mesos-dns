@@ -3,17 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"time"
 
+	"github.com/mesos/mesos-go/detector"
+	"github.com/mesosphere/mesos-dns/detect"
 	"github.com/mesosphere/mesos-dns/logging"
 	"github.com/mesosphere/mesos-dns/records"
 	"github.com/mesosphere/mesos-dns/resolver"
 	"github.com/mesosphere/mesos-dns/util"
-)
-
-const (
-	zkInitialDetectionTimeout = 30 * time.Second
 )
 
 func main() {
@@ -40,73 +39,51 @@ func main() {
 
 	// initialize resolver
 	config := records.SetConfig(*cjson)
-	resolver := resolver.New(version, config)
-
-	var dnsErr, httpErr, zkErr <-chan error
-	var newLeader <-chan struct{}
+	res := resolver.New(version, config)
+	errch := make(chan error)
 
 	// launch DNS server
-	if config.DnsOn {
-		dnsErr = resolver.LaunchDNS()
+	if config.DNSOn {
+		go func() { errch <- <-res.LaunchDNS() }()
 	}
 
 	// launch HTTP server
-	if config.HttpOn {
-		httpErr = resolver.LaunchHTTP()
+	if config.HTTPOn {
+		go func() { errch <- <-res.LaunchHTTP() }()
 	}
 
-	// launch Zookeeper listener
+	changed := make(chan []string, 1)
 	if config.Zk != "" {
-		newLeader, zkErr = resolver.LaunchZK(zkInitialDetectionTimeout)
+		logging.Verbose.Println("Starting master detector for ZK ", config.Zk)
+		if md, err := detector.New(config.Zk); err != nil {
+			log.Fatalf("failed to create master detector: %v", err)
+		} else if err := md.Detect(detect.NewMasters(config.Masters, changed)); err != nil {
+			log.Fatalf("failed to initialize master detector: %v", err)
+		}
 	} else {
-		// uniform behavior when new leader from masters field
-		leader := make(chan struct{}, 1)
-		leader <- struct{}{}
-		newLeader = leader
+		changed <- config.Masters
 	}
 
-	// print error and terminate
-	handleServerErr := func(name string, err error) {
-		if err != nil {
-			logging.Error.Fatalf("%s failed: %v", name, err)
-		} else {
-			logging.Error.Fatalf("%s stopped unexpectedly", name)
-		}
-	}
+	reload := time.NewTicker(time.Second * time.Duration(config.RefreshSeconds))
 
-	// generate reload signal; up to 1 reload pending at any time
-	reloadSignal := make(chan struct{}, 1)
-	tryReload := func() {
-		// non-blocking, attempt to queue a reload
-		select {
-		case reloadSignal <- struct{}{}:
-		default:
-		}
-	}
+	zkTimeout := time.Second * time.Duration(config.ZkDetectionTimeout)
+	timeout := time.AfterFunc(zkTimeout, func() {
+		errch <- fmt.Errorf("master detection timed out after %s", zkTimeout)
+	})
 
-	// periodic loading of DNS state (pull from Master)
-	go func() {
-		defer util.HandleCrash()
-		reloadTimeout := time.Second * time.Duration(config.RefreshSeconds)
-		reloadTimer := time.AfterFunc(reloadTimeout, tryReload)
-		for _ = range reloadSignal {
-			resolver.Reload()
-			logging.PrintCurLog()
-			reloadTimer.Reset(reloadTimeout)
-		}
-	}()
-
-	// infinite loop until there is fatal error
+	defer reload.Stop()
+	defer util.HandleCrash()
 	for {
 		select {
-		case <-newLeader:
-			tryReload()
-		case err := <-dnsErr:
-			handleServerErr("DNS server", err)
-		case err := <-httpErr:
-			handleServerErr("HTTP server", err)
-		case err := <-zkErr:
-			handleServerErr("ZK watcher", err)
+		case <-reload.C:
+			res.Reload()
+		case masters := <-changed:
+			timeout.Stop()
+			logging.VeryVerbose.Printf("new masters detected: %v", masters)
+			res.SetMasters(masters)
+			res.Reload()
+		case err := <-errch:
+			logging.Error.Fatal(err)
 		}
 	}
 }

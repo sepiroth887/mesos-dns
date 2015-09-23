@@ -91,6 +91,7 @@
             ],
             "failover_timeout": 1200,
             "hostname": "localhost",
+            "pid": "scheduler(2)@1.2.3.12:25501",
             "id": "20140703-014514-3041283216-5050-5348-0001",
             "name": "chronos with a space AND MIXED CASE-2.0.1",
             "offers": [],
@@ -129,6 +130,27 @@
         },
         {
             "active": true,
+            "checkpoint": false,
+            "completed_tasks": [],
+            "failover_timeout": 1200,
+            "hostname": "localhost",
+            "id": "20140703-014514-3041283216-5050-5348-0002",
+            "name": "no pid",
+            "offers": [],
+            "registered_time": 1414913537.10742,
+            "reregistered_time": 1414913537.10744,
+            "resources": {
+                "cpus": 0,
+                 "disk": 0,
+                 "mem": 0
+             },
+             "role": "*",
+             "tasks": [],
+             "unregistered_time": 0,
+             "user": "root"
+        },
+        {
+            "active": true,
             "checkpoint": true,
             "completed_tasks": [
                 {
@@ -159,6 +181,7 @@
             "failover_timeout": 604800,
             "hostname": "google.com",
             "id": "20140703-014514-3041283216-5050-5348-0000",
+            "pid": "scheduler(1)@1.2.3.11:25501",
             "name": "marathon",
             "offers": [],
             "registered_time": 1414913536.83611,
@@ -186,7 +209,13 @@
                     "statuses": [
                         {
                             "state": "TASK_RUNNING",
-                            "timestamp": 1409096598.68885
+                            "timestamp": 1409096598.68885,
+                            "labels": [
+                                {
+                                    "key": "foo",
+                                    "value": "bar"
+                                }
+                            ]
                         }
                     ]
                 },
@@ -206,27 +235,165 @@
                     "statuses": [
                         {
                             "state": "TASK_RUNNING",
-                            "timestamp": 1413572390.09275
+                            "timestamp": 1413572371.04321,
+                            "labels": [
+                                {
+                                    "key": "foo",
+                                    "value": "bar"
+                                },
+                                {
+                                    "key": "Docker.NetworkSettings.IPAddress",
+                                    "value": "10.3.0.4"
+                                }
+                            ]
+                        },
+                        {
+                            "state": "TASK_RUNNING",
+                            "timestamp": 1413572390.09275,
+                            "labels": [
+                                {
+                                    "key": "foo",
+                                    "value": "bar"
+                                },
+                                {
+                                    "key": "Docker.NetworkSettings.IPAddress",
+                                    "value": "10.3.0.1"
+                                }
+                            ]
+                        },
+                        {
+                            "state": "TASK_RUNNING",
+                            "timestamp": 1413572381.0123,
+                            "labels": [
+                                {
+                                    "key": "foo",
+                                    "value": "bar"
+                                },
+                                {
+                                    "key": "container-ip",
+                                    "value": ""
+                                }
+                            ]
+                        },
+                        {
+                            "state": "TASK_STARTING",
+                            "timestamp": 1413572380.01234
                         }
-                    ]
+                    ],
+                    "discovery" : {
+                        "version" : "1.0",
+                        "visibility" : "CLUSTER",
+                        "name" : "liquor-store",
+                        "ports" : {
+                            "ports" : [
+                                {
+                                    "number" : 80,
+                                    "protocol" : "tcp",
+                                    "name" : "http"
+                                },
+                                {
+                                    "number" : 443,
+                                    "protocol" : "tcp",
+                                    "name" : "https"
+                                }
+                            ]
+                        },
+                        "location" : "europe",
+                        "labels" : {
+                            "labels" : [
+                                {
+                                    "key" : "dc",
+                                    "value" : "de1"
+                                },
+                                {
+                                    "key" : "canary",
+                                    "value" : "Teneriffa"
+                                }
+                            ]
+                        },
+                        "environment" : "prod"
+                    }
                 },
                 {
                     "executor_id": "",
                     "framework_id": "20140703-014514-3041283216-5050-5348-0000",
                     "id": "liquor-store.b71166c1-562f-11e4-a088-c20493233aa5",
-                    "name": "liquor-store",
+                    "name": "non-human-readable-liquor-store",
                     "resources": {
                         "cpus": 1,
                         "disk": 0,
                         "mem": 1024,
-                        "ports": "[31737-31737]"
+                        "ports": "[31737-31738]"
                     },
                     "slave_id": "20140827-000744-3041283216-5050-2116-1",
                     "state": "TASK_RUNNING",
                     "statuses": [
                         {
                             "state": "TASK_RUNNING",
-                            "timestamp": 1413572383.04559
+                            "timestamp": 1413572383.04559,
+                            "labels": [
+                                {
+                                    "key": "foo",
+                                    "value": "bar"
+                                },
+                                {
+                                    "key": "Docker.NetworkSettings.IPAddress",
+                                    "value": "10.3.0.2"
+                                }
+                            ]
+                        }
+                    ],
+                    "discovery" : {
+                        "version" : "1.0",
+                        "visibility" : "CLUSTER",
+                        "name" : "liquor-store",
+                        "ports" : {
+                            "ports" : [
+                                {
+                                    "number" : 80,
+                                    "protocol" : "tcp",
+                                    "name" : "http"
+                                },
+                                {
+                                    "number" : 443,
+                                    "protocol" : "tcp",
+                                    "name" : "https"
+                                }
+                            ]
+                        },
+                        "location" : "europe",
+                        "labels" : {
+                            "labels" : [
+                                {
+                                    "key" : "dc",
+                                    "value" : "de1"
+                                },
+                                {
+                                    "key" : "canary",
+                                    "value" : "Lanzarote"
+                                }
+                            ]
+                        },
+                        "environment" : "prod"
+                    }
+                },
+                {
+                    "executor_id": "",
+                    "framework_id": "20140703-014514-3041283216-5050-5348-0000",
+                    "id": "car-store.43758382-562f-11e4-a088-c20493233aa5",
+                    "name": "car-store",
+                    "resources": {
+                        "cpus": 1,
+                        "disk": 0,
+                        "mem": 1024,
+                        "ports": "[31364-31364, 31365-31365]"
+                    },
+                    "slave_id": "20140803-125133-3041283216-5050-2410-0",
+                    "state": "TASK_RUNNING",
+                    "statuses": [
+                        {
+                            "state": "TASK_RUNNING",
+                            "timestamp": 1413572123.04321
                         }
                     ]
                 },
@@ -247,6 +414,32 @@
                         {
                             "state": "TASK_RUNNING",
                             "timestamp": 1410896855.5742
+                        }
+                    ]
+                },
+                {
+                    "executor_id": "",
+                    "framework_id": "20140703-014514-3041283216-5050-5348-0000",
+                    "id": "nginx.1bc32344-3dda-11e4-a088-c20493233aa5",
+                    "name": "nginx",
+                    "resources": {
+                        "cpus": 0.1,
+                        "disk": 0,
+                        "mem": 128,
+                        "ports": "[]"
+                    },
+                    "slave_id": "20140803-125133-3041283216-5050-2410-0",
+                    "state": "TASK_RUNNING",
+                    "statuses": [
+                        {
+                            "state": "TASK_RUNNING",
+                            "timestamp": 1410896855.5742,
+                            "labels": [
+                                {
+                                    "key": "MesosContainerizer.NetworkSettings.IPAddress",
+                                    "value": "10.3.0.3"
+                                }
+                            ]
                         }
                     ]
                 },
@@ -322,7 +515,7 @@
             },
             "hostname": "1.2.3.12",
             "id": "20140827-000744-3041283216-5050-2116-1",
-            "pid": "slave(1)@1.2.3:12",
+            "pid": "slave(1)@1.2.3.12:5051",
             "registered_time": 1414913537.19731,
             "reregistered_time": 1414913537.19735,
             "resources": {

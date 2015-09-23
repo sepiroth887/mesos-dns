@@ -32,8 +32,31 @@ func TestClientSync(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to exchange: %v", err)
 	}
-	if r != nil && r.Rcode != RcodeSuccess {
+	if r == nil || r.Rcode != RcodeSuccess {
 		t.Errorf("failed to get an valid answer\n%v", r)
+	}
+}
+
+func TestClientSyncBadId(t *testing.T) {
+	HandleFunc("miek.nl.", HelloServerBadId)
+	defer HandleRemove("miek.nl.")
+
+	s, addrstr, err := RunLocalUDPServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeSOA)
+
+	c := new(Client)
+	if _, _, err := c.Exchange(m, addrstr); err != ErrId {
+		t.Errorf("did not find a bad Id")
+	}
+	// And now with plain Exchange().
+	if _, err := Exchange(m, addrstr); err != ErrId {
+		t.Errorf("did not find a bad Id")
 	}
 }
 
@@ -65,7 +88,6 @@ func TestClientEDNS0(t *testing.T) {
 
 // Validates the transmission and parsing of local EDNS0 options.
 func TestClientEDNS0Local(t *testing.T) {
-
 	optStr1 := "1979:0x0707"
 	optStr2 := strconv.Itoa(EDNS0LOCALSTART) + ":0x0601"
 
@@ -126,20 +148,24 @@ func TestClientEDNS0Local(t *testing.T) {
 	// Validate the local options in the reply.
 	got := r.Extra[1].(*OPT).Option[0].(*EDNS0_LOCAL).String()
 	if got != optStr1 {
-		t.Log("failed to get local edns0 answer; got %s, expected %s", got, optStr1)
+		t.Logf("failed to get local edns0 answer; got %s, expected %s", got, optStr1)
 		t.Fail()
 		t.Logf("%v\n", r)
 	}
 
 	got = r.Extra[1].(*OPT).Option[1].(*EDNS0_LOCAL).String()
 	if got != optStr2 {
-		t.Log("failed to get local edns0 answer; got %s, expected %s", got, optStr2)
+		t.Logf("failed to get local edns0 answer; got %s, expected %s", got, optStr2)
 		t.Fail()
 		t.Logf("%v\n", r)
 	}
 }
 
-func TestSingleSingleInflight(t *testing.T) {
+func TestSingleInflight(t *testing.T) {
+	// Test is inherently racy, because queries might actually be returned before the test
+	// is over, leading to multiple queries even with SingleInflight. This ofcourse then
+	// leads to diff. rrts and the test fails. Number of tests is now 3, to lower the chance
+	// for the race to hit.
 	HandleFunc("miek.nl.", HelloServer)
 	defer HandleRemove("miek.nl.")
 
@@ -154,7 +180,7 @@ func TestSingleSingleInflight(t *testing.T) {
 
 	c := new(Client)
 	c.SingleInflight = true
-	nr := 10
+	nr := 3
 	ch := make(chan time.Duration)
 	for i := 0; i < nr; i++ {
 		go func() {
@@ -165,7 +191,7 @@ func TestSingleSingleInflight(t *testing.T) {
 	i := 0
 	var first time.Duration
 	// With inflight *all* rtt are identical, and by doing actual lookups
-	// the changes that this is a coincidence is small.
+	// the chances that this is a coincidence is small.
 Loop:
 	for {
 		select {
@@ -174,11 +200,11 @@ Loop:
 				first = rtt
 			} else {
 				if first != rtt {
-					t.Errorf("all rtts should be equal.  got %d want %d", rtt, first)
+					t.Errorf("all rtts should be equal, got %d want %d", rtt, first)
 				}
 			}
 			i++
-			if i == 10 {
+			if i == nr {
 				break Loop
 			}
 		}
@@ -210,5 +236,53 @@ func ExampleUpdateLeaseTSIG(t *testing.T) {
 	_, _, err := c.Exchange(m, "127.0.0.1:53")
 	if err != nil {
 		t.Error(err)
+	}
+}
+
+func TestClientConn(t *testing.T) {
+	HandleFunc("miek.nl.", HelloServer)
+	defer HandleRemove("miek.nl.")
+
+	// This uses TCP just to make it slightly different than TestClientSync
+	s, addrstr, err := RunLocalTCPServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Unable to run test server: %v", err)
+	}
+	defer s.Shutdown()
+
+	m := new(Msg)
+	m.SetQuestion("miek.nl.", TypeSOA)
+
+	cn, err := Dial("tcp", addrstr)
+	if err != nil {
+		t.Errorf("failed to dial %s: %v", addrstr, err)
+	}
+
+	err = cn.WriteMsg(m)
+	if err != nil {
+		t.Errorf("failed to exchange: %v", err)
+	}
+	r, err := cn.ReadMsg()
+	if r == nil || r.Rcode != RcodeSuccess {
+		t.Errorf("failed to get an valid answer\n%v", r)
+	}
+
+	err = cn.WriteMsg(m)
+	if err != nil {
+		t.Errorf("failed to exchange: %v", err)
+	}
+	h := new(Header)
+	buf, err := cn.ReadMsgHeader(h)
+	if buf == nil {
+		t.Errorf("failed to get an valid answer\n%v", r)
+	}
+	if int(h.Bits&0xF) != RcodeSuccess {
+		t.Errorf("failed to get an valid answer in ReadMsgHeader\n%v", r)
+	}
+	if h.Ancount != 0 || h.Qdcount != 1 || h.Nscount != 0 || h.Arcount != 1 {
+		t.Errorf("expected to have question and additional in response; got something else: %+v", h)
+	}
+	if err = r.Unpack(buf); err != nil {
+		t.Errorf("unable to unpack message fully: %v", err)
 	}
 }

@@ -1,4 +1,4 @@
-// package records contains functions to generate resource records from
+// Package records contains functions to generate resource records from
 // mesos master states to serve through a dns server
 package records
 
@@ -10,11 +10,13 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/mesosphere/mesos-dns/logging"
 	"github.com/mesosphere/mesos-dns/records/labels"
+	"github.com/mesosphere/mesos-dns/records/state"
 )
 
 // Map host/service name to DNS answer
@@ -22,55 +24,19 @@ import (
 // Will likely become map[string][]discoveryinfo
 type rrs map[string][]string
 
-// Mesos-DNS state
-// Refactor when discovery id is available
+// RecordGenerator contains DNS records and methods to access and manipulate
+// them. TODO(kozyraki): Refactor when discovery id is available.
 type RecordGenerator struct {
-	As     rrs
-	SRVs   rrs
-	Slaves map[string]string
+	As       rrs
+	SRVs     rrs
+	SlaveIPs map[string]string
 }
 
-// The following types help parse state.json
-// Resources holds our SRV ports
-type Resources struct {
-	Ports string `json:"ports"`
-}
-
-// Tasks holds mesos task information read in from state.json
-type Tasks []struct {
-	FrameworkId string `json:"framework_id"`
-	Id          string `json:"id"`
-	Name        string `json:"name"`
-	SlaveId     string `json:"slave_id"`
-	State       string `json:"state"`
-	Resources   `json:"resources"`
-}
-
-// Frameworks holds mesos frameworks information read in from state.json
-type Frameworks []struct {
-	Tasks `json:"tasks"`
-	Name  string `json:"name"`
-}
-
-// Slaves is a mapping of id to hostname read in from state.json
-type slave struct {
-	Id       string `json:"id"`
-	Hostname string `json:"hostname"`
-}
-type Slaves []slave
-
-// StateJSON is a representation of mesos master state.json
-type StateJSON struct {
-	Frameworks `json:"frameworks"`
-	Slaves     `json:"slaves"`
-	Leader     string `json:"leader"`
-}
-
-// Finds the master and inserts DNS state
-func (rg *RecordGenerator) ParseState(leader string, c Config) error {
-
+// ParseState retrieves and parses the Mesos master /state.json and converts it
+// into DNS records.
+func (rg *RecordGenerator) ParseState(c Config, masters ...string) error {
 	// find master -- return if error
-	sj, err := rg.findMaster(leader, c.Masters)
+	sj, err := rg.findMaster(masters...)
 	if err != nil {
 		logging.Error.Println("no master")
 		return err
@@ -81,22 +47,27 @@ func (rg *RecordGenerator) ParseState(leader string, c Config) error {
 		return err
 	}
 
-	hostSpec := labels.ForRFC1123()
+	hostSpec := labels.RFC1123
 	if c.EnforceRFC952 {
-		hostSpec = labels.ForRFC952()
+		hostSpec = labels.RFC952
 	}
 
 	// insert state
-	rg.InsertState(sj, c.Domain, c.SOARname, c.Listener, c.Masters, c.StaticEntryConfig.Entries, hostSpec)
+	rg.InsertState(sj, c.Domain, c.SOARname, c.Listener, masters, c.IPSources, c.StaticEntryConfig.Entries, hostSpec)
 	return nil
 }
 
 // Tries each master and looks for the leader
 // if no leader responds it errors
-func (rg *RecordGenerator) findMaster(leader string, masters []string) (StateJSON, error) {
-	var sj StateJSON
+func (rg *RecordGenerator) findMaster(masters ...string) (state.State, error) {
+	var sj state.State
+	var leader string
 
-	// Check if ZK master is correct
+	if len(masters) > 0 {
+		leader, masters = masters[0], masters[1:]
+	}
+
+	// Check if ZK leader is correct
 	if leader != "" {
 		logging.VeryVerbose.Println("Zookeeper says the leader is: ", leader)
 		ip, port, err := getProto(leader)
@@ -105,16 +76,14 @@ func (rg *RecordGenerator) findMaster(leader string, masters []string) (StateJSO
 		}
 
 		sj, _ = rg.loadWrap(ip, port)
-		if sj.Leader == "" {
-			logging.Verbose.Println("Warning: Zookeeper is wrong about leader")
-			if len(masters) == 0 {
-				return sj, errors.New("no master")
-			} else {
-				logging.Verbose.Println("Warning: falling back to Masters config field: ", masters)
-			}
-		} else {
+		if sj.Leader != "" {
 			return sj, nil
 		}
+		logging.Verbose.Println("Warning: Zookeeper is wrong about leader")
+		if len(masters) == 0 {
+			return sj, errors.New("no master")
+		}
+		logging.Verbose.Println("Warning: falling back to Masters config field: ", masters)
 	}
 
 	// try each listed mesos master before dying
@@ -141,11 +110,20 @@ func (rg *RecordGenerator) findMaster(leader string, masters []string) (StateJSO
 }
 
 // Loads state.json from mesos master
-func (rg *RecordGenerator) loadFromMaster(ip string, port string) (sj StateJSON) {
+func (rg *RecordGenerator) loadFromMaster(ip string, port string) (sj state.State) {
 	// REFACTOR: state.json security
-	url := "http://" + ip + ":" + port + "/master/state.json"
 
-	req, err := http.NewRequest("GET", url, nil)
+	u := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(ip, port),
+		Path:   "/master/state.json",
+	}
+
+	req, err := http.NewRequest("GET", u.String(), nil)
+	if err != nil {
+		logging.Error.Println(err)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
@@ -153,12 +131,12 @@ func (rg *RecordGenerator) loadFromMaster(ip string, port string) (sj StateJSON)
 	if err != nil {
 		logging.Error.Println(err)
 	}
-	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		logging.Error.Println(err)
 	}
+	_ = resp.Body.Close()
 
 	err = json.Unmarshal(body, &sj)
 	if err != nil {
@@ -172,9 +150,9 @@ func (rg *RecordGenerator) loadFromMaster(ip string, port string) (sj StateJSON)
 // attempts can fail from down server or mesos master secondary
 // it also reloads from a different master if the master it attempted to
 // load from was not the leader
-func (rg *RecordGenerator) loadWrap(ip string, port string) (StateJSON, error) {
+func (rg *RecordGenerator) loadWrap(ip string, port string) (state.State, error) {
 	var err error
-	var sj StateJSON
+	var sj state.State
 
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -194,15 +172,15 @@ func (rg *RecordGenerator) loadWrap(ip string, port string) (StateJSON, error) {
 	return sj, err
 }
 
-// hash two long strings into a short one
+// BUG: The probability of hashing collisions is too high with only 17 bits.
+// NOTE: Using a numerical base as high as valid characters in DNS names would
+// reduce the resulting length without risking more collisions.
 func hashString(s string) string {
-	var upper, lower, sum uint16
 	h := fnv.New32a()
-	h.Write([]byte(s))
-	lower = uint16(h.Sum32())
-	upper = uint16(h.Sum32() >> 16)
-	sum = uint16(lower + upper)
-	return strconv.Itoa(int(sum))
+	_, _ = h.Write([]byte(s))
+	sum := h.Sum32()
+	lower, upper := uint16(sum), uint16(sum>>16)
+	return strconv.FormatUint(uint64(lower+upper), 10)
 }
 
 // attempt to translate the hostname into an IPv4 address. logs an error if IP
@@ -221,72 +199,57 @@ func hostToIP4(hostname string) (string, bool) {
 	return ip.String(), true
 }
 
-// attempt to convert the slave hostname to an IP4 address. if that fails, then
-// sanitize the hostname for DNS compat.
-func sanitizedSlaveAddress(hostname string, spec labels.HostNameSpec) string {
-	address, ok := hostToIP4(hostname)
-	if !ok {
-		address = labels.AsDomainFrag(address, spec)
-	}
-	return address
+// InsertState transforms a StateJSON into RecordGenerator RRs
+func (rg *RecordGenerator) InsertState(sj state.State, domain string, ns string, listener string, masters []string, ipSources []string, staticEntries []StaticEntry, spec labels.Func) error {
+
+	rg.SlaveIPs = map[string]string{}
+	rg.SRVs = rrs{}
+	rg.As = rrs{}
+	rg.frameworkRecords(sj, domain, spec)
+	rg.slaveRecords(sj, domain, spec)
+	rg.listenerRecord(listener, ns)
+	rg.masterRecord(domain, masters, sj.Leader)
+	rg.taskRecords(sj, domain, spec, ipSources)
+	rg.staticRecords(staticEntries)
+
+	return nil
 }
 
-// InsertState transforms a StateJSON into RecordGenerator RRs
-func (rg *RecordGenerator) InsertState(sj StateJSON, domain string, ns string,
-	listener string, masters []string, staticEntries []StaticEntry, spec labels.HostNameSpec) error {
-
-	// creates a map with slave IP addresses (IPv4)
-	rg.Slaves = make(map[string]string)
-	for _, slave := range sj.Slaves {
-		rg.Slaves[slave.Id] = sanitizedSlaveAddress(slave.Hostname, spec)
-	}
-
-	rg.SRVs = make(rrs)
-	rg.As = make(rrs)
-
-	// complete crap - refactor me
+// frameworkRecords injects A and SRV records into the generator store:
+//     frameworkname.domain.                 // resolves to IPs of each framework
+//     _framework._tcp.frameworkname.domain. // resolves to the driver port and IP of each framework
+func (rg *RecordGenerator) frameworkRecords(sj state.State, domain string, spec labels.Func) {
 	for _, f := range sj.Frameworks {
-		fname := labels.AsDomainFrag(f.Name, spec)
-		for _, task := range f.Tasks {
-			host, ok := rg.Slaves[task.SlaveId]
-			// skip not running or not discoverable tasks
-			if !ok || (task.State != "TASK_RUNNING") {
-				continue
-			}
-
-			tname := spec.Mangle(task.Name)
-			sid := slaveIdTail(task.SlaveId)
-			tag := hashString(task.Id)
-			tail := fname + "." + domain + "."
-
-			// A records for task and task-sid
-			arec := tname + "." + tail
-			rg.insertRR(arec, host, "A")
-			trec := tname + "-" + tag + "-" + sid + "." + tail
-			rg.insertRR(trec, host, "A")
-
-			// SRV records
-			if task.Resources.Ports != "" {
-				ports := yankPorts(task.Resources.Ports)
-				for _, port := range ports {
-					var srvhost string = trec + ":" + port
-					tcp := "_" + tname + "._tcp." + tail
-					udp := "_" + tname + "._udp." + tail
-					rg.insertRR(tcp, srvhost, "SRV")
-					rg.insertRR(udp, srvhost, "SRV")
-				}
+		fname := labels.DomainFrag(f.Name, labels.Sep, spec)
+		host, port := f.HostPort()
+		if address, ok := hostToIP4(host); ok {
+			a := fname + "." + domain + "."
+			rg.insertRR(a, address, "A")
+			if port != "" {
+				srv := net.JoinHostPort(a, port)
+				rg.insertRR("_framework._tcp."+a, srv, "SRV")
 			}
 		}
 	}
+}
 
-	// Static Entries
-	for _, entry := range staticEntries {
-		rg.insertRR(entry.Fqdn, entry.Value, entry.Type)
+// slaveRecords injects A and SRV records into the generator store:
+//     slave.domain.      // resolves to IPs of all slaves
+//     _slave._tc.domain. // resolves to the driver port and IP of all slaves
+func (rg *RecordGenerator) slaveRecords(sj state.State, domain string, spec labels.Func) {
+	for _, slave := range sj.Slaves {
+		address, ok := hostToIP4(slave.PID.Host)
+		if ok {
+			a := "slave." + domain + "."
+			rg.insertRR(a, address, "A")
+			srv := net.JoinHostPort(a, slave.PID.Port)
+			rg.insertRR("_slave._tcp."+domain+".", srv, "SRV")
+		} else {
+			logging.VeryVerbose.Printf("string '%q' for slave with id %q is not a valid IP address", address, slave.ID)
+			address = labels.DomainFrag(address, labels.Sep, spec)
+		}
+		rg.SlaveIPs[slave.ID] = address
 	}
-
-	rg.listenerRecord(listener, ns)
-	rg.masterRecord(domain, masters, sj.Leader)
-	return nil
 }
 
 // masterRecord injects A and SRV records into the generator store:
@@ -397,6 +360,88 @@ func (rg *RecordGenerator) listenerRecord(listener string, ns string) {
 	}
 }
 
+func (rg *RecordGenerator) taskRecords(sj state.State, domain string, spec labels.Func, ipSources []string) {
+	for _, f := range sj.Frameworks {
+		fname := labels.DomainFrag(f.Name, labels.Sep, spec)
+
+		// insert taks records
+		tail := "." + domain + "."
+		for _, task := range f.Tasks {
+			var ok bool
+			task.SlaveIP, ok = rg.SlaveIPs[task.SlaveID]
+
+			// skip not running or not discoverable tasks
+			if !ok || (task.State != "TASK_RUNNING") {
+				continue
+			}
+
+			// define context
+			ctx := struct{ taskName, taskID, slaveID, taskIP, slaveIP string }{
+				spec(task.Name),
+				hashString(task.ID),
+				slaveIDTail(task.SlaveID),
+				task.IP(ipSources...),
+				task.SlaveIP,
+			}
+
+			// use DiscoveryInfo name if defined instead of task name
+			if task.HasDiscoveryInfo() {
+				ctx.taskName = task.DiscoveryInfo.Name
+			}
+
+			// insert canonical A records
+			canonical := ctx.taskName + "-" + ctx.taskID + "-" + ctx.slaveID + "." + fname
+			arec := ctx.taskName + "." + fname
+
+			rg.insertRR(arec+tail, ctx.taskIP, "A")
+			rg.insertRR(canonical+tail, ctx.taskIP, "A")
+
+			rg.insertRR(arec+".slave"+tail, ctx.slaveIP, "A")
+			rg.insertRR(canonical+".slave"+tail, ctx.slaveIP, "A")
+
+			// Add RFC 2782 SRV records
+			slaveHost := canonical + ".slave" + tail
+			tcpName := "_" + ctx.taskName + "._tcp." + fname
+			udpName := "_" + ctx.taskName + "._udp." + fname
+			for _, port := range task.Ports() {
+				slaveTarget := slaveHost + ":" + port
+
+				if !task.HasDiscoveryInfo() {
+					rg.insertRR(tcpName+tail, slaveTarget, "SRV")
+					rg.insertRR(udpName+tail, slaveTarget, "SRV")
+				}
+
+				rg.insertRR(tcpName+".slave"+tail, slaveTarget, "SRV")
+				rg.insertRR(udpName+".slave"+tail, slaveTarget, "SRV")
+			}
+
+			if !task.HasDiscoveryInfo() {
+				continue
+			}
+
+			for _, port := range task.DiscoveryInfo.Ports.DiscoveryPorts {
+				target := canonical + tail + ":" + strconv.Itoa(port.Number)
+
+				// use protocol if defined, fallback to tcp+udp
+				proto := spec(port.Protocol)
+				if proto != "" {
+					name := "_" + ctx.taskName + "._" + proto + "." + fname
+					rg.insertRR(name+tail, target, "SRV")
+				} else {
+					rg.insertRR(tcpName+tail, target, "SRV")
+					rg.insertRR(udpName+tail, target, "SRV")
+				}
+			}
+		}
+	}
+}
+
+func (rg *RecordGenerator) staticRecords(entries []StaticEntry) {
+	for _, entry := range entries {
+		rg.insertRR(entry.Fqdn, entry.Value, entry.Type)
+	}
+}
+
 // A records for each local interface
 // If this causes problems you should explicitly set the
 // listener address in config.json
@@ -466,11 +511,12 @@ func (rg *RecordGenerator) exists(name, host, rtype string) bool {
 // but only if the pair is unique. returns true if added, false otherwise.
 // TODO(???): REFACTOR when storage is updated
 func (rg *RecordGenerator) insertRR(name, host, rtype string) bool {
-	logging.VeryVerbose.Println("[" + rtype + "]\t" + name + ": " + host)
-
-	if rg.exists(name, host, rtype) {
+	if host == "" || rg.exists(name, host, rtype) {
 		return false
 	}
+
+	logging.VeryVerbose.Println("[" + rtype + "]\t" + name + ": " + host)
+
 	if rtype == "A" {
 		val := rg.As[name]
 		rg.As[name] = append(val, host)
@@ -481,27 +527,6 @@ func (rg *RecordGenerator) insertRR(name, host, rtype string) bool {
 	return true
 }
 
-// returns an array of ports from a range
-func yankPorts(ports string) []string {
-	rhs := strings.Split(ports, "[")[1]
-	lhs := strings.Split(rhs, "]")[0]
-
-	yports := []string{}
-
-	mports := strings.Split(lhs, ",")
-	for _, port := range mports {
-		tmp := strings.TrimSpace(port)
-		pz := strings.Split(tmp, "-")
-		lo, _ := strconv.Atoi(pz[0])
-		hi, _ := strconv.Atoi(pz[1])
-
-		for t := lo; t <= hi; t++ {
-			yports = append(yports, strconv.Itoa(t))
-		}
-	}
-	return yports
-}
-
 // leaderIP returns the ip for the mesos master
 // input format master@ip:port
 func leaderIP(leader string) string {
@@ -510,7 +535,7 @@ func leaderIP(leader string) string {
 }
 
 // return the slave number from a Mesos slave id
-func slaveIdTail(slaveID string) string {
+func slaveIDTail(slaveID string) string {
 	fields := strings.Split(slaveID, "-")
 	return strings.ToLower(fields[len(fields)-1])
 }

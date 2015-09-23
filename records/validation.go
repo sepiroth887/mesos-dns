@@ -16,6 +16,16 @@ var ValidSRVRegex = "^[a-zA-Z0-9_][a-zA-Z0-9-._]{1,61}$"
 // ValidHostPortRegex can validate Host:Port pairs (though it allow anychar as host for now and ports > 65365 < 99999)
 var ValidHostPortRegex = "[a-zA-Z0-9\\.]+:[0-9]{1,5}"
 
+func validateEnabledServices(c *Config) error {
+	if !c.DNSOn && !c.HTTPOn {
+		return fmt.Errorf("Either DNS or HTTP server should be on")
+	}
+	if len(c.Masters) == 0 && c.Zk == "" {
+		return fmt.Errorf("specify mesos masters or zookeeper in config.json")
+	}
+	return nil
+}
+
 // validateMasters checks that each master in the list is a properly formatted host:ip pair.
 // duplicate masters in the list are not allowed.
 // returns nil if the masters list is empty, or else all masters in the list are valid.
@@ -101,4 +111,23 @@ func validateStaticEntryFile(sef string) (StaticEntryConfig, error) {
 	}
 
 	return conf, err
+}
+
+// validateIPSources checks validity of ip sources
+func validateIPSources(srcs []string) error {
+	if len(srcs) == 0 {
+		return fmt.Errorf("empty ip sources")
+	}
+	if len(srcs) != len(unique(srcs)) {
+		return fmt.Errorf("duplicate ip source specified")
+	}
+	for _, src := range srcs {
+		switch src {
+		case "host", "docker", "mesos", "netinfo":
+		default:
+			return fmt.Errorf("invalid ip source %q", src)
+		}
+	}
+
+	return nil
 }

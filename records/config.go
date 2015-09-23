@@ -2,6 +2,7 @@ package records
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net"
 	"os/user"
@@ -21,6 +22,9 @@ type Config struct {
 
 	// Zookeeper: a single Zk url
 	Zk string
+
+	// Zookeeper Detection Timeout: how long in seconds to wait for Zookeeper to be initially responsive (default 30)
+	ZkDetectionTimeout int
 
 	// Refresh frequency: the frequency in seconds of regenerating records (default 60)
 	RefreshSeconds int
@@ -59,12 +63,13 @@ type Config struct {
 	// ListenAddr is the server listener address
 	Listener string
 
-	// Http port
-	HttpPort int
+	// NOTE(tsenart): HTTPPort, DNSOn and HTTPOn have defined JSON keys for
+	// backwards compatibility with external API clients.
+	HTTPPort int `json:"HttpPort"`
 
 	// Enable serving DSN and HTTP requests
-	DnsOn  bool
-	HttpOn bool
+	DNSOn  bool `json:"DnsOn"`
+	HTTPOn bool `json:"HttpOn"`
 
 	// Enable replies for external requests
 	ExternalOn bool
@@ -77,59 +82,48 @@ type Config struct {
 
 	// StaticEntryConfig is the deserialized content of StaticEntryFile
 	StaticEntryConfig StaticEntryConfig
+
+	// IPSources is the prioritized list of task IP sources
+	IPSources []string // e.g. ["host", "docker", "mesos", "rkt"]
+}
+
+// NewConfig return the default config of the resolver
+func NewConfig() Config {
+	return Config{
+		ZkDetectionTimeout: 30,
+		RefreshSeconds:     60,
+		TTL:                60,
+		Domain:             "mesos",
+		Port:               53,
+		Timeout:            5,
+		SOARname:           "root.ns1.mesos",
+		SOAMname:           "ns1.mesos",
+		SOARefresh:         60,
+		SOARetry:           600,
+		SOAExpire:          86400,
+		SOAMinttl:          60,
+		Resolvers:          []string{"8.8.8.8"},
+		Listener:           "0.0.0.0",
+		HTTPPort:           8123,
+		DNSOn:              true,
+		HTTPOn:             true,
+		ExternalOn:         true,
+		RecurseOn:          true,
+		IPSources:          []string{"netinfo", "mesos", "host"},
+		StaticEntryFile:    "",
+	}
 }
 
 // SetConfig instantiates a Config struct read in from config.json
-func SetConfig(cjson string) (c Config) {
-	c = Config{
-		RefreshSeconds:  60,
-		TTL:             60,
-		Domain:          "mesos",
-		Port:            53,
-		Timeout:         5,
-		SOARname:        "root.ns1.mesos",
-		SOAMname:        "ns1.mesos",
-		SOARefresh:      60,
-		SOARetry:        600,
-		SOAExpire:       86400,
-		SOAMinttl:       60,
-		Resolvers:       []string{"8.8.8.8"},
-		Listener:        "0.0.0.0",
-		HttpPort:        8123,
-		DnsOn:           true,
-		HttpOn:          true,
-		ExternalOn:      true,
-		RecurseOn:       true,
-		StaticEntryFile: "",
-	}
-
-	// read configuration file
-	usr, _ := user.Current()
-	dir := usr.HomeDir + "/"
-	cjson = strings.Replace(cjson, "~/", dir, 1)
-
-	path, err := filepath.Abs(cjson)
+func SetConfig(cjson string) Config {
+	c, err := readConfig(cjson)
 	if err != nil {
-		logging.Error.Fatalf("cannot find configuration file")
+		logging.Error.Fatal(err)
 	}
-
-	b, err := ioutil.ReadFile(path)
-	if err != nil {
-		logging.Error.Fatalf("missing configuration file")
-	}
-	c.File = path
-
-	err = json.Unmarshal(b, &c)
-	if err != nil {
-		logging.Error.Println(err)
-	}
-
 	// validate and complete configuration file
-	if !(c.DnsOn || c.HttpOn) {
-		logging.Error.Fatalf("Either DNS or HTTP server should be on")
-	}
-	if len(c.Masters) == 0 && c.Zk == "" {
-		logging.Error.Fatalf("specify mesos masters or zookeeper in config.json")
+	err = validateEnabledServices(c)
+	if err != nil {
+		logging.Error.Fatalf("service validation failed: %v", err)
 	}
 	if err = validateMasters(c.Masters); err != nil {
 		logging.Error.Fatalf("Masters validation failed: %v", err)
@@ -143,35 +137,31 @@ func SetConfig(cjson string) (c Config) {
 			c.Resolvers = GetLocalDNS()
 		}
 		if err = validateResolvers(c.Resolvers); err != nil {
-			logging.Error.Fatalf("Resovlers validation failed: %v", err)
+			logging.Error.Fatalf("Resolvers validation failed: %v", err)
 		}
+	}
+
+	if err = validateIPSources(c.IPSources); err != nil {
+		logging.Error.Fatalf("IPSources validation failed: %v", err)
 	}
 
 	c.Domain = strings.ToLower(c.Domain)
 
 	// SOA record fields
-	c.SOARname = strings.Replace(c.SOARname, "@", ".", -1)
-	if c.SOARname[len(c.SOARname)-1:] != "." {
-		c.SOARname = c.SOARname + "."
-	}
-	if c.SOAMname[len(c.SOAMname)-1:] != "." {
-		c.SOAMname = c.SOAMname + "."
-	}
+	c.SOARname = strings.TrimRight(strings.Replace(c.SOARname, "@", ".", -1), ".") + "."
+	c.SOAMname = strings.TrimRight(c.SOAMname, ".") + "."
 	c.SOASerial = uint32(time.Now().Unix())
 
 	// print configuration file
 	logging.Verbose.Println("Mesos-DNS configuration:")
-	if len(c.Masters) != 0 {
-		logging.Verbose.Println("   - Masters: " + strings.Join(c.Masters, ", "))
-	}
-	if c.Zk != "" {
-		logging.Verbose.Println("   - Zookeeper: ", c.Zk)
-	}
+	logging.Verbose.Println("   - Masters: " + strings.Join(c.Masters, ", "))
+	logging.Verbose.Println("   - Zookeeper: ", c.Zk)
+	logging.Verbose.Println("   - ZookeeperDetectionTimeout: ", c.ZkDetectionTimeout)
 	logging.Verbose.Println("   - RefreshSeconds: ", c.RefreshSeconds)
 	logging.Verbose.Println("   - Domain: " + c.Domain)
 	logging.Verbose.Println("   - Listener: " + c.Listener)
 	logging.Verbose.Println("   - Port: ", c.Port)
-	logging.Verbose.Println("   - DnsOn: ", c.DnsOn)
+	logging.Verbose.Println("   - DnsOn: ", c.DNSOn)
 	logging.Verbose.Println("   - TTL: ", c.TTL)
 	logging.Verbose.Println("   - Timeout: ", c.Timeout)
 	logging.Verbose.Println("   - Resolvers: " + strings.Join(c.Resolvers, ", "))
@@ -184,13 +174,50 @@ func SetConfig(cjson string) (c Config) {
 	logging.Verbose.Println("   - SOAExpire: ", c.SOAExpire)
 	logging.Verbose.Println("   - SOAExpire: ", c.SOAMinttl)
 	logging.Verbose.Println("   - RecurseOn: ", c.RecurseOn)
-	logging.Verbose.Println("   - HttpPort: ", c.HttpPort)
-	logging.Verbose.Println("   - HttpOn: ", c.HttpOn)
+	logging.Verbose.Println("   - HttpPort: ", c.HTTPPort)
+	logging.Verbose.Println("   - HttpOn: ", c.HTTPOn)
 	logging.Verbose.Println("   - ConfigFile: ", c.File)
 	logging.Verbose.Println("   - EnforceRFC952: ", c.EnforceRFC952)
+	logging.Verbose.Println("   - IPSources: ", c.IPSources)
 	logging.Verbose.Println("   - StaticEntryFile: ", c.StaticEntryFile)
 
-	return c
+	return *c
+}
+
+func readConfig(file string) (*Config, error) {
+	c := NewConfig()
+
+	workingDir := "."
+	usr, err := user.Current()
+	if err != nil {
+		// this can happen (on Linux) if you're running mesos-dns as a non-root user.
+		logging.Error.Println("Failed to determine current user, translating ~/ to ./, error was", err)
+	} else {
+		workingDir = usr.HomeDir
+	}
+
+	c.File, err = filepath.Abs(strings.Replace(file, "~/", workingDir+"/", 1))
+	if err != nil {
+		return nil, fmt.Errorf("cannot find configuration file")
+	} else if bs, err := ioutil.ReadFile(c.File); err != nil {
+		return nil, fmt.Errorf("missing configuration file: %q", c.File)
+	} else if err = json.Unmarshal(bs, &c); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config file %q: %v", c.File, err)
+	}
+
+	return &c, nil
+}
+
+func unique(ss []string) []string {
+	set := make(map[string]struct{}, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if _, ok := set[s]; !ok {
+			set[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // GetLocalDNS returns the first nameserver in /etc/resolv.conf
