@@ -69,7 +69,7 @@ func validate(t *testing.T, i int, tc validationTest, f func([]string) error) {
 
 func TestValidateStaticEntryFile(t *testing.T) {
 	// Testing valid first
-	validJSON := "{ \"Entries\" : [{\"Fqdn\": \"hello.world\", \"Type\": \"A\", \"Value\": \"10.0.0.1\"}, {\"Fqdn\": \"_hello._tcp_.world\", \"Type\": \"SRV\", \"Value\": \"10.0.0.1:323\"}]}"
+	validJSON := "{ \"Entries\" : [{\"Fqdn\": \"hello.world.\", \"Type\": \"A\", \"Value\": \"10.0.0.1\"}, {\"Fqdn\": \"_hello._tcp.world.\", \"Type\": \"SRV\", \"Value\": \"10.0.0.1:323\"}]}"
 
 	CreateTempFile(validJSON, "/tmp/valid.json", t)
 	conf, err := validateStaticEntryFile("/tmp/valid.json")
@@ -111,7 +111,6 @@ func TestValidateStaticEntryFile(t *testing.T) {
 	// Testing bad Record data
 	invalidFQDN := "{ \"Entries\" : [{\"Fqdn\": \"hello.world+-23\", \"Type\": \"A\", \"Value\": \"10.0.0.1\"}]}"
 	invalidIP := "{ \"Entries\" : [{\"Fqdn\": \"hello.world\", \"Type\": \"A\", \"Value\": \"10.0.0.av1\"}]}"
-	invalidSRV := "{ \"Entries\" : [{\"Fqdn\": \"_hello+110.!world\", \"Type\": \"SRV\", \"Value\": \"10.0.0.0:1234\"}]}"
 	invalidHostPort := "{ \"Entries\" : [{\"Fqdn\": \"_hello._world\", \"Type\": \"SRV\", \"Value\": \"10.0.ase20.0:a1234\"}]}"
 
 	CreateTempFile(invalidFQDN, "/tmp/invalid.json", t)
@@ -122,13 +121,6 @@ func TestValidateStaticEntryFile(t *testing.T) {
 	}
 
 	CreateTempFile(invalidIP, "/tmp/invalid.json", t)
-	conf, err = validateStaticEntryFile("/tmp/invalid.json")
-
-	if err == nil {
-		t.Fatal("Expected error")
-	}
-
-	CreateTempFile(invalidSRV, "/tmp/invalid.json", t)
 	conf, err = validateStaticEntryFile("/tmp/invalid.json")
 
 	if err == nil {

@@ -53,24 +53,30 @@ func main() {
 	}
 
 	changed := make(chan []string, 1)
-	if config.Zk != "" {
-		logging.Verbose.Println("Starting master detector for ZK ", config.Zk)
-		if md, err := detector.New(config.Zk); err != nil {
-			log.Fatalf("failed to create master detector: %v", err)
-		} else if err := md.Detect(detect.NewMasters(config.Masters, changed)); err != nil {
-			log.Fatalf("failed to initialize master detector: %v", err)
+	connected := make(chan bool, 1)
+
+	go func() {
+		if config.Zk != "" {
+			logging.Verbose.Println("Starting master detector for ZK ", config.Zk)
+			if md, err := detector.New(config.Zk); err != nil {
+				log.Fatalf("failed to create master detector: %v", err)
+			} else if err := md.Detect(detect.NewMasters(config.Masters, changed)); err != nil {
+				log.Fatalf("failed to initialize master detector: %v", err)
+			}
+		} else {
+			changed <- config.Masters
+			connected <- true
 		}
-	} else {
-		changed <- config.Masters
-	}
+	}()
 
 	reload := time.NewTicker(time.Second * time.Duration(config.RefreshSeconds))
 
 	zkTimeout := time.Second * time.Duration(config.ZkDetectionTimeout)
 	timeout := time.AfterFunc(zkTimeout, func() {
-		errch <- fmt.Errorf("master detection timed out after %s", zkTimeout)
+		connected <- false
 	})
 
+	res.Reload()
 	defer reload.Stop()
 	defer util.HandleCrash()
 	for {
@@ -83,7 +89,13 @@ func main() {
 			res.SetMasters(masters)
 			res.Reload()
 		case err := <-errch:
-			logging.Error.Fatal(err)
+			logging.VeryVerbose.Println(err)
+		case isConnected := <-connected:
+			if isConnected {
+				logging.Verbose.Println("Connected to masters")
+			} else {
+				logging.VeryVerbose.Println("Not yet connected to masters")
+			}
 		}
 	}
 }

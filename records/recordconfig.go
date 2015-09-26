@@ -3,9 +3,7 @@ package records
 import (
 	"encoding/json"
 	"io/ioutil"
-	"os/user"
 	"path/filepath"
-	"strings"
 )
 
 // StaticEntryConfig holds a slice of DNS entries
@@ -28,10 +26,6 @@ func ParseStaticConfig(jsonFile string) (StaticEntryConfig, error) {
 	conf := StaticEntryConfig{}
 
 	// read configuration file
-	usr, _ := user.Current()
-	dir := usr.HomeDir + "/"
-	jsonFile = strings.Replace(jsonFile, "~/", dir, 1)
-
 	path, err := filepath.Abs(jsonFile)
 	if err != nil {
 		return conf, err

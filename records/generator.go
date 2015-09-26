@@ -39,10 +39,17 @@ func (rg *RecordGenerator) ParseState(c Config, masters ...string) error {
 	sj, err := rg.findMaster(masters...)
 	if err != nil {
 		logging.Error.Println("no master")
+		if rg.As == nil {
+			rg.As = rrs{}
+		}
+		if rg.SRVs == nil {
+			rg.SRVs = rrs{}
+		}
+		rg.staticRecords(c.StaticEntryConfig.Entries)
 		return err
 	}
 	if sj.Leader == "" {
-		logging.Error.Println("Unexpected error")
+		logging.Error.Println("No leader yet")
 		err = errors.New("empty master")
 		return err
 	}

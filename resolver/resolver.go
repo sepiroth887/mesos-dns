@@ -141,16 +141,16 @@ func (res *Resolver) Reload() {
 	t := records.RecordGenerator{}
 	err := t.ParseState(res.config, res.masters...)
 
-	if err == nil {
-		timestamp := uint32(time.Now().Unix())
-		// may need to refactor for fairness
-		res.rsLock.Lock()
-		defer res.rsLock.Unlock()
-		res.config.SOASerial = timestamp
-		res.rs = &t
-	} else {
-		logging.VeryVerbose.Println("Warning: master not found; keeping old DNS state")
+	if err != nil {
+		logging.VeryVerbose.Println("Warning: master not found; serving only static entries")
 	}
+
+	timestamp := uint32(time.Now().Unix())
+	// may need to refactor for fairness
+	res.rsLock.Lock()
+	defer res.rsLock.Unlock()
+	res.config.SOASerial = timestamp
+	res.rs = &t
 
 	logging.PrintCurLog()
 }

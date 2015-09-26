@@ -2,16 +2,11 @@ package records
 
 import (
 	"fmt"
+	"github.com/miekg/dns"
 	"net"
 	"os"
 	"regexp"
 )
-
-// ValidFQDNRegex can be used to validate fqdn strings for A records
-var ValidFQDNRegex = "^[a-zA-Z0-9][a-zA-Z0-9-\\.]{1,61}$"
-
-// ValidSRVRegex can be used to validate host strings for SRV records
-var ValidSRVRegex = "^[a-zA-Z0-9_][a-zA-Z0-9-._]{1,61}$"
 
 // ValidHostPortRegex can validate Host:Port pairs (though it allow anychar as host for now and ports > 65365 < 99999)
 var ValidHostPortRegex = "[a-zA-Z0-9\\.]+:[0-9]{1,5}"
@@ -93,12 +88,12 @@ func validateStaticEntryFile(sef string) (StaticEntryConfig, error) {
 			if ip == nil {
 				return conf, fmt.Errorf("Invalid IP on StaticEntry: %q", entry.Value)
 			}
-			if match, _ := regexp.MatchString(ValidFQDNRegex, entry.Fqdn); !match {
+			if !dns.IsFqdn(entry.Fqdn) {
 				return conf, fmt.Errorf("Invalid FQDN: %s", entry.Fqdn)
 			}
 			break
 		case "SRV":
-			if match, _ := regexp.MatchString(ValidSRVRegex, entry.Fqdn); !match {
+			if _, ok := dns.IsDomainName(entry.Fqdn); !ok {
 				return conf, fmt.Errorf("Invalid SRV FQDN: %s", entry.Fqdn)
 			}
 			if match, _ := regexp.MatchString(ValidHostPortRegex, entry.Value); !match {
